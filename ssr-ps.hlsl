@@ -8,19 +8,16 @@
   // Contains values regarding the viewport, such as viewport dimensions.
   // contains the `screen_pos_to_texel2` function.
 #include "screen-space.hlsli"
-  // Contains view and projection matricies, along with frustum data such as 
-  // farPlaneZ.
+  // Contains view (+viewInv) and projection matricies, along with frustum data
+  // such as farPlaneZ.
 #include "view-proj.hlsli"
 
-  // Maximum number of samples to take during ray march.
+  // Number of samples the ray is divided into
 static const uint maxIterations = 100;
-  // How far in view space to travel between samples.
-static const float stride = 0.3;
-  // Farthest away the ray can be from the viewpoint without being cut off.
-  // Value is negative, as -Z is forward.
-static const float maxZ = -500;
+  // Maximum distance a ray travels from its source.
+static const float maxDistance = 100;
   // How "thick" each pixel is in viewspace.
-static const float thickness = 0.7;
+static const float thickness = 2;
   // Surfaces with roughness above this value do not have reflections
   // calculated for them.
 static const float maxRoughness = 0.5;
@@ -51,45 +48,44 @@ struct VSOut
   // Basic sampler state
 SamplerState smp : register(s0);
 
-  // Calculated lighting data for the scene
-Texture2D lightTex     : register(t0);
   // Surface albedo values / Fresnel response for metallic surfaces.
-Texture2D albedoTex    : register(t1);
+Texture2D albedoTex    : register(t0);
   // How metallic / dialectric a surface is.
-Texture2D metallicTex  : register(t2);
+Texture2D metallicTex  : register(t1);
   // How "rough" a surface is.
-Texture2D roughnessTex : register(t3);
+Texture2D roughnessTex : register(t2);
   // Per-fragment normal vector. Alpha channel contains linear scene depth as 
   // a fraction of the far plane's Z.
-Texture2D normalTex    : register(t4);
+Texture2D normalTex    : register(t3);
   // Viewspace position of a fragment. Should be reconstructed instead of 
   // sampled in the future.
-Texture2D posTex       : register(t5);
+Texture2D posTex       : register(t4);
+  // Calculated lighting data for the scene
+Texture2D lightTex     : register(t5);
+
+  // Skybox texture, used as fallback if the ray hits nothing.
+TextureCube skyTex     : register(t9);
 
   // Function for translating a viewspace position into a texture coordinate.
-float2 get_sample_coord(float3 pos)
+float2 get_sample_coord(float3 pos, float2 jitterVal)
 {
-    // Perform translation into NDC.
-  float4 position = float4(pos, 1);
-  position = mul(proj, position);
-  position /= position.w;
-
     // Get texture-space coordinate.
-  float2 coord = (position.xy + 1) / 2;
+  float2 coord = (pos.xy + 1) / 2;
   coord.y = 1 - coord.y;
-
+  
     // Need to account for resolution scaling when sampling.
   coord.x *= screenScaleX;
   coord.y *= screenScaleY;
 
-  return coord;
+    // Jitter looks kinda bad, taking it out for now.
+  return coord;// +jitterVal;
 }
 
   // Squared distance between two points.
 float dist_squared(float3 p1, float3 p2)
 {
-  float3 p = p2 - p1;
-  return abs(dot(p, p));
+  p2 -= p1;
+  return abs(dot(p2, p2));
 }
 
   // Performs fading for samples taken along the edge of the screen.
@@ -132,23 +128,26 @@ float4 main(VSOut pin) : SV_TARGET0
     // Translate screen coordinates into texture UV coordinates.
   float2 coords = screen_pos_to_texel2(pin.pos.xy);
 
-    // If the fragment is empty, don't do anything.
+    // If the fragment is empty, return the existing color
   if (posTex.Sample(smp, coords).w < epsilon)
-    discard;
+    return lightTex.Sample(smp, coords);
 
-    // Get tex size
+    // Get screen tex size
   uint w = 1, h = 1, mips = 1;
   lightTex.GetDimensions(0, w, h, mips);
 
     // Sample textures
   float4 normSamp = normalTex.Sample(smp, coords);
-  float3 position = posTex.Sample(smp, coords).rgb;
+  float4 position = posTex.Sample(smp, coords).rgbr;
+  position.w = 1;
   float4 color    = lightTex.Sample(smp, coords);
   float roughness = roughnessTex.Sample(smp, coords).r;
   float metallic  = metallicTex.Sample(smp, coords).r;
   float3 albedo   = albedoTex.Sample(smp, coords).rgb;
 
-  float3 initPos = position;
+    // Value used to jitter sample position. Currently unused
+  float2 jitter = float2(0, 0);
+  jitter.y = float(int(pin.pos.x + pin.pos.y) & 1) * 4 * (1.f / h);
 
     // Don't calculate reflections for rough surfaces.
   if (roughness > maxRoughness)
@@ -159,60 +158,92 @@ float4 main(VSOut pin) : SV_TARGET0
     // Metallic surfaces should have tinted reflections.
   float4 outColor = float4(lerp(1 - roughness, albedo, metallic), 1);
 
+    // Calculate value to reduce reflection intensity by based on roughness
+    // value of the surface.
+  float roughnessFalloff = (1 - roughness / maxRoughness);
+    // Squared roughnessFalloff looks a bit better.
+  roughnessFalloff *= roughnessFalloff;
+
     // Get normal
-  float3 normal = normalize(normSamp.rgb);
+  float4 normal = normalize(normSamp.rgb).rgbr;
+  normal.w = 0;
+
+    // Offset the initial position to reduce self-intersection issues.
+  position += normal * 0.1f;
 
 
     // Calculate ray direction
-  float3 incoming = normalize(position);
-  float3 rayDir   = normalize(reflect(incoming, normal));
+  float4 incoming = normalize(position.rgb).rgbr;
+  incoming.w = 0;
+  float4 rayDir   = normalize(reflect(incoming, normal)).rgbr;
+  rayDir.w = 0;
 
+    // Find ray begin / end
+  float4 initPos = position;
+  float4 endPoint = initPos + rayDir * maxDistance;
+  // TODO: Clip ray
+
+    // Ray's viewspace Z begin / end
+  float initZ = initPos.z;
+  float endZ = endPoint.z;
+
+    // Project the ray's position into clip space
+  position = mul(proj, position);
+  initPos = position;
+  endPoint = mul(proj, endPoint);
+
+    // How far to scale the kernel samples. Based on ray distance and 
+    // surface roughness.
+  float blurRadius =
+    (roughness / maxRoughness) *
+    blurRoughnessMultiplier;
+
+    // Get blurred skybox sample
+  uint cw = 0, ch = 0, cmips = 0;
+  skyTex.GetDimensions(0, cw, ch, cmips);
+  float4 skyboxColor = skyTex.SampleLevel(smp, mul(viewInv, rayDir), (1 - roughnessFalloff) * cmips * 0.5);
+  skyboxColor *= roughnessFalloff;
+  skyboxColor *= outColor;
 
     // ray march
   [loop] for (uint iteration = 0; iteration < maxIterations; ++iteration)
   {
       // Move the ray forward.
-    position += rayDir * stride;
+    position = lerp(initPos, endPoint, float(iteration) / float(maxIterations));
+    float currentZ = lerp(initZ, endZ, float(iteration) / float(maxIterations));
   
-      // Check if the ray has gone behind the viewpoint.
-    if (position.z > 0)
+      // Check if the ray has gone beyond the viewport.
+    if (position.z < 0 || position.z > position.w)
     {
-      // exit, no hit
-      return float4(color.rgb, 1);
-    }
-  
-      // Check if the ray has traveled too far from the viewpoint.
-    if (position.z < maxZ)
-    {
-      // exit, no hit
-      return float4(color.rgb, 1);
+      return float4(color.rgb, 1) + skyboxColor;
     }
     
       // Retrieve texture-space coordinates of the ray's location.
-    float2 sampCoord = get_sample_coord(position);
+    position /= position.w;
+    float2 sampCoord = get_sample_coord(position, jitter);
 
       // Exit if we're outside the screen.
     if (any(sampCoord > 1) || any(sampCoord < 0))
     {
-      return float4(color.rgb, 1);
+      return float4(color.rgb, 1) + skyboxColor;
     }
 
       // Test for a hit. If the ray's depth is between the sampled depth and a
       // thickness value, report it as a hit.
       // Normal texture contains linear scene depth in its alpha channel.
     float pixelDepth = 
-      normalTex.Sample(smp, get_sample_coord(position)).a * farPlaneZ;
+      normalTex.Load(int3(sampCoord * float2(w, h), 0)).a * farPlaneZ;
 
-    if (pixelDepth > position.z && pixelDepth - thickness < position.z)
+    if (pixelDepth > currentZ && pixelDepth - thickness < currentZ)
     {
         // We hit something!
 
         // Check hit normal, if it's facing the same direction as the ray dir,
         // we hit the back face and need to discard this sample.
-      float3 hitNorm = normalize(normalTex.Sample(smp, sampCoord).rgb);
+      float3 hitNorm = normalize(normalTex.Load(int3(sampCoord * float2(w, h), 0)).rgb);
       if (dot(hitNorm, rayDir) > 0)
       {
-        return float4(color.rgb, 1);
+        return float4(color.rgb, 1) + skyboxColor;
       }
 
         // Distance falloff
@@ -222,20 +253,10 @@ float4 main(VSOut pin) : SV_TARGET0
       edge_fading(sampCoord, falloff);
 
         // thickness fade. Grazing hits are likely to appear distorted, so 
-        // fade them out.
-      falloff = lerp(0, falloff, 
-        (position.z - (pixelDepth - thickness)) / thickness
-      );
-
-        // Roughness fade
-      falloff = falloff * (1- roughness / maxRoughness);
-      
-        // How far to scale the kernel samples. Based on ray distance and 
-        // surface roughness.
-      float blurRadius = 
-        (dist_squared(position, initPos) / (blurDist*blurDist)) * 
-        (roughness / maxRoughness) * 
-        blurRoughnessMultiplier;
+        // fade them out. It's up for debate as to if this looks good or not.
+      //falloff = lerp(0, falloff, 
+      //  (currentZ - (pixelDepth - thickness)) / thickness
+      //);
 
         // Final sample color
       float4 sampledColor = 0;
@@ -246,15 +267,15 @@ float4 main(VSOut pin) : SV_TARGET0
           // Location to sample at
         float2 currentSampLoc = 
           sampCoord + 
-          kernel[i] * float2(1 / (float)w, 1 / (float)h) * 
+          kernel[i].xy * float2(1 / (float)w, 1 / (float)h) * 
           blurRadius;
 
           // Sampled Color
         float4 currentSamp =
-          float4(lightTex.Sample(smp, currentSampLoc).rgb, 1);
+          float4(lightTex.Load(int3(currentSampLoc * float2(w, h), 0)).rgb, 1);
           // Sampled depth value
         float currentSampDepth = 
-          normalTex.Sample(smp, currentSampLoc).a * farPlaneZ;
+          normalTex.Load(int3(currentSampLoc * float2(w, h), 0)).a * farPlaneZ;
         
           // Make sure this sample is near the ray hit.
         float rangeCheck = 
@@ -262,15 +283,17 @@ float4 main(VSOut pin) : SV_TARGET0
 
           // If it is, add it to the output color
         sampledColor += currentSamp * rangeCheck;
+        sampledColor += skyboxColor * (1 - rangeCheck);
       }
       sampledColor /= kernelSize;
 
         // Final color
-      return float4(color.rgb, 1) + outColor * sampledColor * falloff;
+      return float4(color.rgb, 1) + outColor * sampledColor * falloff * roughnessFalloff + skyboxColor * (1 - falloff);
     }
   }
 
     // Return base color if the ray traveled its full distance but hit nothing.
-  return float4(color.rgb, 1);
+  //return float4(1, 0, 0, 1);
+  return float4(color.rgb, 1) + skyboxColor;
 }
 
